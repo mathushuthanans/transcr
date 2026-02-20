@@ -1,12 +1,13 @@
 import sys
-from PyQt5.QtWidgets import QApplication, QMainWindow, QLabel, QVBoxLayout, QHBoxLayout, QWidget, QFrame  # Added QHBoxLayout!
-from PyQt5.QtCore import Qt, pyqtSignal, QObject
-from PyQt5.QtGui import QFont, QPalette, QColor
-from socketio import Client
+import os
+os.environ["QT_QPA_PLATFORM"] = "xcb"
 
-import threading
 import logging
-from model import ContinuousTranscriber
+from PyQt5.QtWidgets import (QApplication, QMainWindow, QLabel, QVBoxLayout, 
+                            QHBoxLayout, QWidget, QFrame, QPushButton, QComboBox)
+from PyQt5.QtCore import Qt, QTimer, pyqtSignal, QObject, QThread, pyqtSlot
+from PyQt5.QtGui import QFont, QPalette, QColor
+from model import ContinuousTranscriber  # Your existing model
 
 logging.basicConfig(
     level=logging.DEBUG,
@@ -14,80 +15,75 @@ logging.basicConfig(
 )
 logger = logging.getLogger(__name__)
 
-class SocketThread(QObject):
-    transcription_received = pyqtSignal(str, str)
-    connection_status = pyqtSignal(bool)
+# Worker thread for transcription (from window.py)
+class TranscriptionWorker(QObject):
+    translation_ready = pyqtSignal(str, str)  # (transcription, translation)
+    status = pyqtSignal(str)
+    error = pyqtSignal(str)
 
     def __init__(self):
         super().__init__()
-        self.socketio = Client(
-            logger=True,
-            engineio_logger=True,
-            reconnection=True,
-            reconnection_attempts=5,
-            reconnection_delay=1
-        )
-        self.setup_socket_events()
+        self.transcriber = None
+        self.running = False
 
-    def setup_socket_events(self):
-        @self.socketio.on('connect')
-        def on_connect():
-            logger.info(f"Connected to server with SID: {self.socketio.sid}")
-            self.connection_status.emit(True)
-
-        @self.socketio.on('disconnect')
-        def on_disconnect():
-            logger.info("Disconnected from server")
-            self.connection_status.emit(False)
-
-        @self.socketio.on('transcription_update')
-        def on_transcription(data):
-            try:
-                if isinstance(data, dict):
-                    transcription = data.get('transcription', '')
-                    translation = data.get('translation', '')
-                    self.transcription_received.emit(
-                        transcription or '💬 Waiting...',
-                        translation or '🌍 Waiting...'
-                    )
-            except Exception as e:
-                logger.error(f"Error processing transcription update: {e}")
-
-    def connect_to_server(self):
+    @pyqtSlot(str)
+    def start(self, target_language='en'):
         try:
-            self.socketio.connect(
-                'http://localhost:5000',
-                transports=['websocket', 'polling'],
-                wait_timeout=10,
-                wait=True
+            if self.transcriber:
+                self.stop()
+            
+            self.status.emit(f"🎤 Listening → {target_language}")
+            self.transcriber = ContinuousTranscriber(target_language=target_language)
+            self.transcriber.set_callback(self.callback)
+            self.transcriber.start_transcription()
+            self.running = True
+        except Exception as e:
+            self.error.emit(str(e))
+
+    def callback(self, transcription, translation):
+        """Called by ContinuousTranscriber with real-time results"""
+        if transcription or translation:
+            self.translation_ready.emit(
+                transcription or "🎤 Listening...",
+                translation or "🌍 Translating..."
             )
-            return True
-        except Exception as e:
-            logger.error(f"Failed to connect to server: {e}")
-            return False
 
-    def disconnect(self):
-        try:
-            if self.socketio.connected:
-                self.socketio.disconnect()
-        except Exception as e:
-            logger.error(f"Error during disconnect: {e}")
+    @pyqtSlot()
+    def stop(self):
+        if self.transcriber:
+            self.transcriber.stop_transcription()
+            self.transcriber = None
+        self.running = False
+        self.status.emit("⏸ Idle")
 
-class CyberCaptionWindow(QMainWindow):
+class AllInOneCaptionWindow(QMainWindow):
     def __init__(self):
         super().__init__()
-        self.socket_handler = None
-        self.local_transcriber = None
+        
+        # Setup worker thread
+        self.thread = QThread()
+        self.worker = TranscriptionWorker()
+        self.worker.moveToThread(self.thread)
+        self.thread.start()
+        
+        # Typing animation (from window.py)
+        self.typing_timer = QTimer(self)
+        self.typing_timer.timeout.connect(self.type_effect)
+        self.full_transcription = ""
+        self.full_translation = ""
+        self.shown_transcription = ""
+        self.shown_translation = ""
+        
         self.initUI()
-        self.setupSocket()
-        self.setupLocalTranscriber()
+        self.connectSignals()
 
     def initUI(self):
-        self.setWindowTitle('⚡ LiveSpeak')
-        self.setGeometry(300, 300, 900, 350)
-        self.setMinimumSize(900, 350)
+        # Window setup - keeping your cyberpunk theme from caption_window.py
+        self.setWindowTitle('LiveSpeak')
+        self.setGeometry(300, 300, 900, 400)
+        self.setMinimumSize(900, 400)
 
-        # Cyberpunk neon theme
+        # Cyberpunk neon theme (from caption_window.py)
         self.setStyleSheet("""
             QMainWindow {
                 background: #0a0e27;
@@ -161,6 +157,23 @@ class CyberCaptionWindow(QMainWindow):
                 border-radius: 12px;
                 padding: 5px 15px;
             }
+            QComboBox, QPushButton {
+                background: #14182f;
+                color: #00ffff;
+                border: 2px solid #00ffff;
+                border-radius: 8px;
+                padding: 8px;
+                font-family: 'Courier New';
+                font-weight: bold;
+                min-width: 120px;
+            }
+            QPushButton:hover {
+                background: #00ffff;
+                color: #0a0e27;
+            }
+            QComboBox:hover {
+                border-color: #ff00cc;
+            }
         """)
 
         central_widget = QWidget()
@@ -169,7 +182,7 @@ class CyberCaptionWindow(QMainWindow):
         main_layout.setSpacing(20)
         main_layout.setContentsMargins(20, 20, 20, 20)
 
-        # Header with glitch effect
+        # Header
         header_frame = QFrame()
         header_frame.setObjectName("headerFrame")
         header_frame.setFixedHeight(60)
@@ -179,14 +192,36 @@ class CyberCaptionWindow(QMainWindow):
         header_label.setObjectName("headerLabel")
         header_label.setAlignment(Qt.AlignCenter)
         header_layout.addWidget(header_label)
-        
         main_layout.addWidget(header_frame)
 
-        # Main content area
+        # Controls (NEW - from window.py)
+        controls_layout = QHBoxLayout()
+        controls_layout.addStretch()
+        
+        # Language selector
+        self.lang_combo = QComboBox()
+        languages = {
+            'English': 'en', 'Spanish': 'es', 'French': 'fr', 
+            'German': 'de', 'Japanese': 'ja', 'Chinese': 'zh'
+        }
+        for lang in languages.keys():
+            self.lang_combo.addItem(f"🌐 {lang}", languages[lang])
+        
+        # Start/Stop button
+        self.toggle_btn = QPushButton("▶ START CAPTURE")
+        self.toggle_btn.setCheckable(True)
+        self.toggle_btn.setFixedWidth(200)
+        
+        controls_layout.addWidget(self.lang_combo)
+        controls_layout.addWidget(self.toggle_btn)
+        controls_layout.addStretch()
+        main_layout.addLayout(controls_layout)
+
+        # Main content area (dual panel from caption_window.py)
         content_layout = QHBoxLayout()
         content_layout.setSpacing(20)
 
-        # Transcription panel (left)
+        # Transcription panel
         transcript_panel = QFrame()
         transcript_panel.setObjectName("transcriptFrame")
         transcript_layout = QVBoxLayout(transcript_panel)
@@ -196,7 +231,7 @@ class CyberCaptionWindow(QMainWindow):
         transcript_header.setObjectName("transcriptHeader")
         transcript_header.setAlignment(Qt.AlignCenter)
 
-        self.transcription_label = QLabel('💬 Awaiting neural input...')
+        self.transcription_label = QLabel('💬 Click START to begin...')
         self.transcription_label.setObjectName("transcriptContent")
         self.transcription_label.setWordWrap(True)
         self.transcription_label.setAlignment(Qt.AlignCenter)
@@ -204,7 +239,7 @@ class CyberCaptionWindow(QMainWindow):
         transcript_layout.addWidget(transcript_header)
         transcript_layout.addWidget(self.transcription_label)
 
-        # Translation panel (right)
+        # Translation panel
         translation_panel = QFrame()
         translation_panel.setObjectName("translationFrame")
         translation_layout = QVBoxLayout(translation_panel)
@@ -214,7 +249,7 @@ class CyberCaptionWindow(QMainWindow):
         translation_header.setObjectName("translationHeader")
         translation_header.setAlignment(Qt.AlignCenter)
 
-        self.translation_label = QLabel('🌐 Decoding...')
+        self.translation_label = QLabel('🌐 Select language...')
         self.translation_label.setObjectName("translationContent")
         self.translation_label.setWordWrap(True)
         self.translation_label.setAlignment(Qt.AlignCenter)
@@ -230,10 +265,10 @@ class CyberCaptionWindow(QMainWindow):
         # Status bar
         status_layout = QHBoxLayout()
         
-        self.status_label = QLabel('🔴 SYSTEM OFFLINE')
+        self.status_label = QLabel('🟡 SYSTEM READY')
         self.status_label.setObjectName("statusLabel")
         
-        version_label = QLabel('v2.0.1 • NEON')
+        version_label = QLabel('v3.0 • ALL-IN-ONE')
         version_label.setObjectName("statusLabel")
         version_label.setAlignment(Qt.AlignRight)
         
@@ -246,74 +281,69 @@ class CyberCaptionWindow(QMainWindow):
         # Window properties
         self.setWindowFlags(Qt.WindowStaysOnTopHint)
 
-    def update_connection_status(self, connected):
-        if connected:
-            self.setWindowTitle('⚡ NEON CAPTIONS v2.0 • ONLINE')
-            self.status_label.setText('🟢 SYSTEM ONLINE')
-            self.status_label.setStyleSheet("""
-                color: #00ff00;
-                border: 1px solid #00ff00;
-                background: #1a1f3a;
-            """)
+    def connectSignals(self):
+        """Connect all signals and slots"""
+        self.toggle_btn.toggled.connect(self.toggle_capture)
+        self.worker.translation_ready.connect(self.start_typing_animation)
+        self.worker.status.connect(self.status_label.setText)
+        self.worker.error.connect(self.show_error)
+
+    def toggle_capture(self, checked):
+        """Start or stop transcription"""
+        if checked:
+            self.toggle_btn.setText("⏹ STOP CAPTURE")
+            target_lang = self.lang_combo.currentData()
+            QTimer.singleShot(0, lambda: self.worker.start(target_lang))
+            self.transcription_label.setText("🎤 Listening...")
+            self.translation_label.setText("🌍 Translating...")
         else:
-            self.setWindowTitle('⚡ NEON CAPTIONS v2.0 • OFFLINE')
-            self.status_label.setText('🔴 SYSTEM OFFLINE')
-            self.status_label.setStyleSheet("""
-                color: #ff4444;
-                border: 1px solid #ff4444;
-                background: #1a1f3a;
-            """)
+            self.toggle_btn.setText("▶ START CAPTURE")
+            QTimer.singleShot(0, self.worker.stop)
+            self.transcription_label.setText("💬 Capture stopped")
+            self.translation_label.setText("🌐 Select language...")
 
-    def setupSocket(self):
-        self.socket_handler = SocketThread()
-        self.socket_handler.transcription_received.connect(self.update_labels)
-        self.socket_handler.connection_status.connect(self.update_connection_status)
+    def start_typing_animation(self, transcription, translation):
+        """Prepare for typing animation"""
+        self.full_transcription = transcription
+        self.full_translation = translation
+        self.shown_transcription = ""
+        self.shown_translation = ""
+        self.typing_timer.start(15)
+
+    def type_effect(self):
+        """Animate text appearing (from window.py)"""
+        # Update transcription
+        if len(self.shown_transcription) < len(self.full_transcription):
+            self.shown_transcription += self.full_transcription[len(self.shown_transcription)]
+            self.transcription_label.setText(self.shown_transcription)
         
-        self.socket_thread = threading.Thread(target=self._connect_socket)
-        self.socket_thread.daemon = True
-        self.socket_thread.start()
+        # Update translation
+        if len(self.shown_translation) < len(self.full_translation):
+            self.shown_translation += self.full_translation[len(self.shown_translation)]
+            self.translation_label.setText(self.shown_translation)
+        
+        # Stop timer when both are complete
+        if (len(self.shown_transcription) >= len(self.full_transcription) and 
+            len(self.shown_translation) >= len(self.full_translation)):
+            self.typing_timer.stop()
 
-    def setupLocalTranscriber(self):
-        try:
-            self.local_transcriber = ContinuousTranscriber(target_language='en')
-            self.local_transcriber.set_callback(self.on_local_transcription)
-            self.local_transcriber.start_transcription()
-            logger.info("Local transcriber started")
-        except Exception as e:
-            logger.error(f"Failed to start local transcriber: {e}")
-
-    def _connect_socket(self):
-        success = self.socket_handler.connect_to_server()
-        logger.info(f"Socket connection {'successful' if success else 'failed'}")
-
-    def update_labels(self, transcription, translation):
-        try:
-            self.transcription_label.setText(transcription)
-            self.translation_label.setText(translation)
-        except Exception as e:
-            logger.error(f"Error updating labels: {e}")
-
-    def on_local_transcription(self, transcription, translation=None):
-        try:
-            if not self.socket_handler or not self.socket_handler.socketio.connected:
-                self.transcription_label.setText(transcription)
-                self.translation_label.setText('⚡ LOCAL MODE • No translation')
-        except Exception as e:
-            logger.error(f"Error handling local transcription: {e}")
+    def show_error(self, msg):
+        """Show error in status"""
+        self.status_label.setText(f"🔴 ERROR: {msg[:30]}...")
 
     def closeEvent(self, event):
-        if self.socket_handler:
-            self.socket_handler.disconnect()
-        if self.local_transcriber:
-            self.local_transcriber.stop_transcription()
-        super().closeEvent(event)
+        """Clean shutdown"""
+        self.worker.stop()
+        self.thread.quit()
+        self.thread.wait(2000)
+        event.accept()
 
-def run_caption_window():
+def run():
     app = QApplication(sys.argv)
     app.setStyle('Fusion')
-    window = CyberCaptionWindow()
+    window = AllInOneCaptionWindow()
     window.show()
     sys.exit(app.exec_())
 
 if __name__ == '__main__':
-    run_caption_window()
+    run()
